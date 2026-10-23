@@ -1,0 +1,103 @@
+name: Build release artifacts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            kernel_arch: x86
+            go_arch: amd64
+            image: arch/x86/boot/bzImage
+            cross_compile: ""
+            compiler_package: ""
+          - target: arm64
+            kernel_arch: arm64
+            go_arch: arm64
+            image: arch/arm64/boot/Image
+            cross_compile: aarch64-linux-gnu-
+            compiler_package: gcc-aarch64-linux-gnu
+          - target: riscv64
+            kernel_arch: riscv
+            go_arch: riscv64
+            image: arch/riscv/boot/Image
+            cross_compile: riscv64-linux-gnu-
+            compiler_package: gcc-riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Get u-root source
+        run: git clone --depth 1 --branch v0.16.0 https://github.com/u-root/u-root.git u-root
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            bc bison build-essential dwarves flex libelf-dev libssl-dev \
+            ${{ matrix.compiler_package }}
+      - name: Build Linux kernel
+        env:
+          CROSS_COMPILE: ${{ matrix.cross_compile }}
+          KERNEL_ARCH: ${{ matrix.kernel_arch }}
+          TARGET: ${{ matrix.target }}
+          KERNEL_VERSION: 7.3
+        run: |
+          mkdir -p dist
+          curl --fail --location --silent --show-error \
+            "https://github.com/torvalds/linux/archive/refs/tags/v${KERNEL_VERSION}.tar.gz" \
+            | tar -xz
+          kernel_dir="$GITHUB_WORKSPACE/linux-${KERNEL_VERSION}"
+          output_dir="$GITHUB_WORKSPACE/linux-build"
+          make -C "$kernel_dir" O="$output_dir" ARCH="$KERNEL_ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" defconfig
+          "$kernel_dir/scripts/kconfig/merge_config.sh" -m -O "$output_dir" \
+            "$output_dir/.config" "$GITHUB_WORKSPACE/configs/linux/${TARGET}.config"
+          make -C "$kernel_dir" O="$output_dir" ARCH="$KERNEL_ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+          make -C "$kernel_dir" O="$output_dir" ARCH="$KERNEL_ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" -j"$(nproc)"
+          cp "$output_dir/${{ matrix.image }}" "dist/kernel-${TARGET}"
+      - name: Build u-root
+        working-directory: u-root
+        run: go install .
+      - name: Build u-root initramfs
+        env:
+          GOARCH: ${{ matrix.go_arch }}
+          GOOS: linux
+          TARGET: ${{ matrix.target }}
+        working-directory: u-root
+        run: |
+          "$(go env GOPATH)/bin/u-root" -o "$GITHUB_WORKSPACE/dist/initramfs-${TARGET}.cpio"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach artifacts to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
